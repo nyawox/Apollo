@@ -26,6 +26,7 @@
 #include <wlanapi.h>
 #include <ws2tcpip.h>
 #include <wtsapi32.h>
+#include <shellapi.h>
 #include <sddl.h>
 // clang-format on
 
@@ -785,41 +786,25 @@ namespace platf {
     }
 
     auto raw_target = raw_cmd_parts.at(0);
-    std::wstring lookup_string;
+
+    // If the target is not a URL, assume it's a regular file path
+    auto extension = PathFindExtensionW(raw_target.c_str());
+    if (extension == nullptr || *extension == 0) {
+      // If the file has no extension, assume it's a command and allow CreateProcess()
+      // to try to find it via PATH
+      return from_utf8(raw_cmd);
+    }
+    else if (boost::iequals(extension, L".exe")) {
+      // If the file has an .exe extension, we will bypass the resolution here and
+      // directly pass the unmodified command string to CreateProcess(). The argument
+      // escaping rules are subtly different between CreateProcess() and ShellExecute(),
+      // and we want to preserve backwards compatibility with older configs.
+      return from_utf8(raw_cmd);
+    }
+
+    // For regular files, the class is found using the file extension (including the dot)
+    std::wstring lookup_string = extension;
     HRESULT res;
-
-    if (PathIsURLW(raw_target.c_str())) {
-      std::array<WCHAR, 128> scheme;
-
-      DWORD out_len = scheme.size();
-      res = UrlGetPartW(raw_target.c_str(), scheme.data(), &out_len, URL_PART_SCHEME, 0);
-      if (res != S_OK) {
-        BOOST_LOG(warning) << "Failed to extract URL scheme from URL: "sv << raw_target << " ["sv << util::hex(res).to_string_view() << ']';
-        return from_utf8(raw_cmd);
-      }
-
-      // If the target is a URL, the class is found using the URL scheme (prior to and not including the ':')
-      lookup_string = scheme.data();
-    }
-    else {
-      // If the target is not a URL, assume it's a regular file path
-      auto extension = PathFindExtensionW(raw_target.c_str());
-      if (extension == nullptr || *extension == 0) {
-        // If the file has no extension, assume it's a command and allow CreateProcess()
-        // to try to find it via PATH
-        return from_utf8(raw_cmd);
-      }
-      else if (boost::iequals(extension, L".exe")) {
-        // If the file has an .exe extension, we will bypass the resolution here and
-        // directly pass the unmodified command string to CreateProcess(). The argument
-        // escaping rules are subtly different between CreateProcess() and ShellExecute(),
-        // and we want to preserve backwards compatibility with older configs.
-        return from_utf8(raw_cmd);
-      }
-
-      // For regular files, the class is found using the file extension (including the dot)
-      lookup_string = extension;
-    }
 
     std::array<WCHAR, MAX_PATH> shell_command_string;
     bool needs_cmd_escaping = false;
@@ -1047,6 +1032,40 @@ namespace platf {
     });
 
     BOOL ret;
+
+    // Check if the command is a URI, if true, handle it directly
+    auto cmd_w = from_utf8(cmd);
+    auto raw_cmd_parts = boost::program_options::split_winmain(cmd_w);
+    if (!raw_cmd_parts.empty()) {
+      auto raw_target = raw_cmd_parts.at(0);
+      if (PathIsURLW(raw_target.c_str())) {
+        BOOST_LOG(info) << "Opening URI: " << cmd;
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        sei.lpVerb = L"open";
+        sei.lpFile = raw_target.c_str();
+        sei.nShow = SW_SHOWNORMAL;
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+
+        PROCESS_INFORMATION process_info = {};
+        std::error_code ec;
+
+        if (ShellExecuteExW(&sei)) {
+          ret = true;
+          if (sei.hProcess != NULL) {
+            process_info.hProcess = sei.hProcess;
+            process_info.dwProcessId = GetProcessId(sei.hProcess);
+          }
+        } else {
+          DWORD error = GetLastError();
+          ec = std::error_code(static_cast<int>(error), std::system_category());
+        }
+
+        return create_boost_child_from_results(ret, cmd, ec, process_info);
+      }
+    }
+
+    // Fall back to ordinary path of launching a command though it still might fail
+
     if (is_running_as_system()) {
       // Duplicate the current user's token
       HANDLE user_token = retrieve_users_token(elevated);
